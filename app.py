@@ -59,6 +59,7 @@ def download_video(url: str, folder: Path, progress: Any) -> tuple[Path, str]:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
         "retries": 3,
         "socket_timeout": 30,
         "progress_hooks": [lambda data: progress(data)],
@@ -361,7 +362,7 @@ with st.form("clipper_form", clear_on_submit=False):
     api_key = st.text_input("OpenAI API key", type="password", disabled=not use_openai, help="Used only for transcript topic matching. Whisper and video rendering run locally.")
     col1, col2 = st.columns(2)
     with col1:
-        whisper_model = st.selectbox("Whisper model", ["tiny", "base", "small", "medium"], index=1, help="Larger models improve accuracy but need more memory and time.")
+        whisper_model = st.selectbox("Whisper model", ["tiny", "base", "small", "medium"], index=0, help="Larger models improve accuracy but need more memory and time.")
         device = st.selectbox("Compute", ["auto", "cpu", "cuda"], index=0)
     with col2:
         clip_count = st.slider("Maximum clips", min_value=1, max_value=MAX_CLIPS, value=3)
