@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,17 @@ MAX_CLIPS = 5
 MAX_CLIP_SECONDS = 60
 OUTPUT_WIDTH = 720
 OUTPUT_HEIGHT = 1280
+
+LOCAL_DOWNLOAD_GUIDANCE = (
+    "YouTube returned HTTP 403 from the app host. On Streamlit Community Cloud this commonly means "
+    "the shared datacenter IP is being blocked; changing request headers cannot reliably fix that. "
+    "If you are using Community Cloud, run the app on your own computer instead: install FFmpeg, open a terminal in the app folder, "
+    "run `python -m pip install -r requirements.txt`, then run `streamlit run app.py`."
+)
+
+
+class VideoDownloadError(RuntimeError):
+    """A download failure that has already been displayed with its diagnostic trace."""
 
 
 def clean_filename(value: str) -> str:
@@ -44,49 +56,110 @@ def validate_youtube_url(url: str) -> None:
         raise ValueError("That URL does not appear to be a YouTube link.")
 
 
+def server_setting(name: str, default: str = "") -> str:
+    """Read a server-side setting from environment variables or Streamlit secrets."""
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, default)).strip()
+    except Exception:
+        return default
+
+
 def download_video(
     url: str,
     folder: Path,
     progress: Any,
     max_seconds: int | None = None,
 ) -> tuple[Path, str]:
+    traces: list[str] = []
     try:
         import yt_dlp
-    except ImportError as exc:
-        raise RuntimeError("yt-dlp is not installed. Install requirements.txt first.") from exc
 
-    folder.mkdir(parents=True, exist_ok=True)
-    output_template = str(folder / "source.%(ext)s")
-    options = {
-        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "merge_output_format": "mp4",
-        "outtmpl": output_template,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "impersonate": "chrome",
-        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
-        "retries": 3,
-        "socket_timeout": 30,
-        "progress_hooks": [lambda data: progress(data)],
-    }
-    if max_seconds is not None:
-        options["download_ranges"] = lambda _info, _ydl: [{"start_time": 0, "end_time": max_seconds}]
-        options["force_keyframes_at_cuts"] = True
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url.strip(), download=True)
-            title = str(info.get("title") or "YouTube video")
-        candidates = list(folder.glob("source.*"))
-        candidates = [p for p in candidates if p.suffix.lower() not in {".part", ".ytdl"}]
-        if not candidates:
-            raise RuntimeError("yt-dlp finished without producing a video file.")
-        return candidates[0], title
+        folder.mkdir(parents=True, exist_ok=True)
+        output_template = str(folder / "source.%(ext)s")
+        clients = ["tv", "tv_embedded", "ios", "android", "web_safari", "web"]
+
+        # PO tokens are video/session-specific and should come from a maintained provider.
+        # Configure these as Streamlit secrets or environment variables; never hard-code them.
+        token = server_setting("YTDLP_PO_TOKEN")
+        token_client = server_setting("YTDLP_PO_TOKEN_CLIENT", "mweb") or "mweb"
+        if token and token_client not in clients:
+            clients.insert(0, token_client)
+
+        cookies_file = server_setting("YTDLP_COOKIES_FILE")
+        cookies_content = server_setting("YTDLP_COOKIES")
+        if cookies_content:
+            # Useful on hosted services where the cookie file itself cannot be mounted.
+            cookies_path = folder / "youtube_cookies.txt"
+            cookies_path.write_text(cookies_content, encoding="utf-8")
+            cookies_file = str(cookies_path)
+        if cookies_file and not Path(cookies_file).is_file():
+            raise FileNotFoundError("YTDLP_COOKIES_FILE is set, but that cookie file does not exist on this server.")
+
+        common_options: dict[str, Any] = {
+            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.youtube.com/",
+                "Origin": "https://www.youtube.com",
+            },
+            "retries": 3,
+            "fragment_retries": 3,
+            "extractor_retries": 3,
+            "file_access_retries": 2,
+            "socket_timeout": 30,
+            "concurrent_fragment_downloads": 1,
+            "progress_hooks": [lambda data: progress(data)],
+        }
+        if cookies_file:
+            common_options["cookiefile"] = cookies_file
+        if max_seconds is not None:
+            common_options["download_ranges"] = lambda _info, _ydl: [{"start_time": 0, "end_time": max_seconds}]
+            common_options["force_keyframes_at_cuts"] = True
+
+        for client in clients:
+            # Remove partial output from a previous failed client attempt.
+            for old_file in folder.glob("source.*"):
+                if old_file.is_file():
+                    old_file.unlink()
+            options = {
+                **common_options,
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            }
+            if token and client == token_client:
+                options["extractor_args"]["youtube"]["po_token"] = [f"{client}.gvs+{token}"]
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url.strip(), download=True)
+                candidates = [p for p in folder.glob("source.*") if p.suffix.lower() not in {".part", ".ytdl"}]
+                if candidates:
+                    return candidates[0], str(info.get("title") or "YouTube video")
+                raise RuntimeError(f"yt-dlp client '{client}' completed without producing a video file.")
+            except Exception:
+                traces.append(f"Client '{client}' failed:\n{traceback.format_exc()}")
+
+        error_text = "\n\n".join(traces)
+        is_403 = any("403" in item or "forbidden" in item.lower() for item in traces)
+        summary = LOCAL_DOWNLOAD_GUIDANCE if is_403 else "All configured YouTube download clients failed. Check the trace below for the exact yt-dlp errors."
+        st.error(f"{summary}\n\n```text\n{error_text or traceback.format_exc()}\n```")
+        if is_403:
+            st.info("If you administer this deployment, a supported PO Token provider may help for formats that require tokens. Configure YTDLP_PO_TOKEN and YTDLP_PO_TOKEN_CLIENT secrets. If authentication is actually needed, use YTDLP_COOKIES with a Netscape-format cookie export or YTDLP_COOKIES_FILE with a server-side file. Treat cookies like passwords. yt-dlp's YouTube OAuth login is no longer supported.")
+        raise VideoDownloadError(summary)
+    except VideoDownloadError:
+        raise
     except Exception as exc:
-        message = str(exc)
-        if any(word in message.lower() for word in ("private", "unavailable", "not available", "video is not available")):
-            raise RuntimeError(f"YouTube could not provide this video: {message}") from exc
-        raise RuntimeError(f"Video download failed: {message}") from exc
+        # Keep the exact stack visible in Streamlit, including import/configuration errors.
+        if not traces:
+            st.error(f"Video download failed: {exc}\n\n```text\n{traceback.format_exc()}\n```")
+        raise VideoDownloadError(f"Video download failed: {exc}") from exc
 
 
 def transcribe(video_path: Path, model_name: str, device: str, progress: Any) -> list[dict[str, Any]]:
@@ -339,9 +412,11 @@ def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
         folder = Path(temp)
         try:
             video, title = download_video(youtube_url, folder, lambda _data: None, max_seconds=12)
+        except VideoDownloadError:
+            raise
         except Exception as exc:
             if "403" in str(exc) or "forbidden" in str(exc).lower():
-                raise RuntimeError(f"Diagnostic download was blocked with HTTP 403 despite Chrome impersonation and client fallbacks: {exc}") from exc
+                raise RuntimeError(f"Diagnostic download was blocked with HTTP 403 after all configured YouTube client fallbacks: {exc}") from exc
             raise
         log.append(f"YouTube snippet download passed ({title}).")
         segments = transcribe(video, "tiny", "cpu", lambda _progress, _message: None)
@@ -417,7 +492,8 @@ def run_workflow(url: str, topic: str, api_key: str, use_openai: bool, model: st
             status.update(label="Finished", state="complete", expanded=False)
     except Exception as exc:
         status.update(label="Could not complete the workflow", state="error")
-        st.error(str(exc))
+        if not isinstance(exc, VideoDownloadError):
+            st.error(str(exc))
 
 
 st.title("✂️ Local AI Video Clipper")
@@ -470,7 +546,8 @@ with st.expander("Run end-to-end diagnostic"):
                     st.download_button("Download diagnostic clip", diagnostic_video, file_name="diagnostic_vertical_captioned.mp4", mime="video/mp4", key="diagnostic_download", use_container_width=True)
                 except Exception as exc:
                     diagnostic_status.update(label="Diagnostic failed", state="error", expanded=True)
-                    st.error(str(exc))
+                    if not isinstance(exc, VideoDownloadError):
+                        st.error(str(exc))
 
 clips = st.session_state.get("clips", [])
 if clips:
