@@ -44,7 +44,12 @@ def validate_youtube_url(url: str) -> None:
         raise ValueError("That URL does not appear to be a YouTube link.")
 
 
-def download_video(url: str, folder: Path, progress: Any) -> tuple[Path, str]:
+def download_video(
+    url: str,
+    folder: Path,
+    progress: Any,
+    max_seconds: int | None = None,
+) -> tuple[Path, str]:
     try:
         import yt_dlp
     except ImportError as exc:
@@ -59,11 +64,15 @@ def download_video(url: str, folder: Path, progress: Any) -> tuple[Path, str]:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "ios"]}},
+        "impersonate": "chrome",
+        "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
         "retries": 3,
         "socket_timeout": 30,
         "progress_hooks": [lambda data: progress(data)],
     }
+    if max_seconds is not None:
+        options["download_ranges"] = lambda _info, _ydl: [{"start_time": 0, "end_time": max_seconds}]
+        options["force_keyframes_at_cuts"] = True
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             info = ydl.extract_info(url.strip(), download=True)
@@ -282,7 +291,10 @@ def make_clip(ffmpeg: str, video: Path, segments: list[dict[str, Any]], match: d
     start, end = float(match["start"]), float(match["end"])
     ass_path = folder / f"captions_{index:02d}.ass"
     output = folder / f"clip_{index:02d}.mp4"
-    write_ass(ass_path, subtitle_events(segments, start, end))
+    events = subtitle_events(segments, start, end)
+    if not events or not any(r"\kf" in event for event in events):
+        raise RuntimeError("No timed caption events were available for this clip; Whisper must return speech timestamps.")
+    write_ass(ass_path, events)
     vf = f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,subtitles='{ffmpeg_filter_path(ass_path)}'"
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{end-start:.3f}", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-maxrate", "2500k", "-bufsize", "5000k", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=20 * 60)
@@ -290,6 +302,62 @@ def make_clip(ffmpeg: str, video: Path, segments: list[dict[str, Any]], match: d
         detail = (result.stderr or "FFmpeg did not create an output file.").strip()[-2500:]
         raise RuntimeError(f"Could not render clip {index}: {detail}")
     return output
+
+
+def verify_vertical_caption_clip(ffmpeg: str, clip: Path, ass_path: Path) -> None:
+    """Check the rendered file dimensions and that timed ASS captions were burned by FFmpeg."""
+    if not ass_path.is_file():
+        raise RuntimeError("Caption verification failed: the generated ASS subtitle file is missing.")
+    subtitle_text = ass_path.read_text(encoding="utf-8")
+    if "[Events]" not in subtitle_text or "Dialogue:" not in subtitle_text or r"\kf" not in subtitle_text:
+        raise RuntimeError("Caption verification failed: no word-timed subtitle events were rendered.")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("ffprobe was not found, so the rendered clip could not be verified.")
+    result = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(clip)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Could not inspect the rendered clip: {(result.stderr or '').strip()}")
+    try:
+        stream = json.loads(result.stdout)["streams"][0]
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Could not read video dimensions from the rendered clip.") from exc
+    if (stream.get("width"), stream.get("height")) != (OUTPUT_WIDTH, OUTPUT_HEIGHT):
+        raise RuntimeError(f"Expected a {OUTPUT_WIDTH}×{OUTPUT_HEIGHT} vertical clip; got {stream.get('width')}×{stream.get('height')}.")
+
+
+def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
+    """Run a small end-to-end downloader, Whisper, crop and caption smoke check."""
+    validate_youtube_url(youtube_url)
+    ffmpeg = require_ffmpeg()
+    log = ["URL validation passed.", "FFmpeg is available."]
+    with tempfile.TemporaryDirectory(prefix="clipper_diagnostic_") as temp:
+        folder = Path(temp)
+        try:
+            video, title = download_video(youtube_url, folder, lambda _data: None, max_seconds=12)
+        except Exception as exc:
+            if "403" in str(exc) or "forbidden" in str(exc).lower():
+                raise RuntimeError(f"Diagnostic download was blocked with HTTP 403 despite Chrome impersonation and client fallbacks: {exc}") from exc
+            raise
+        log.append(f"YouTube snippet download passed ({title}).")
+        segments = transcribe(video, "tiny", "cpu", lambda _progress, _message: None)
+        word_count = sum(len(segment["words"]) for segment in segments)
+        if word_count == 0:
+            raise RuntimeError("Whisper completed but returned no word timestamps; the caption check cannot continue.")
+        log.append(f"Whisper tiny transcription passed ({word_count} word timestamps).")
+        duration = max((segment["end"] for segment in segments), default=0.0)
+        end = min(12.0, duration)
+        if end <= 0.5:
+            raise RuntimeError("The downloaded snippet was too short to render a diagnostic clip.")
+        match = {"start": 0.0, "end": end}
+        clip = make_clip(ffmpeg, video, segments, match, 1, folder)
+        verify_vertical_caption_clip(ffmpeg, clip, folder / "captions_01.ass")
+        log.append("Vertical 720×1280 MP4 rendered with word-timed ASS captions burned in via FFmpeg.")
+        return clip.read_bytes(), log
 
 
 def run_workflow(url: str, topic: str, api_key: str, use_openai: bool, model: str, device: str, clip_count: int, clip_duration: int) -> None:
@@ -384,6 +452,25 @@ if submitted:
         else:
             chosen_device = device
         run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration)
+
+with st.expander("Run end-to-end diagnostic"):
+    st.write("Downloads the first 12 seconds of a public YouTube video, transcribes it with Whisper tiny on CPU, and renders a vertical sample with word-timed captions. This uses the same downloader and FFmpeg rendering path as clip creation.")
+    diagnostic_url = st.text_input("YouTube URL for diagnostic", key="diagnostic_youtube_url", placeholder="https://www.youtube.com/watch?v=…")
+    if st.button("Run diagnostic", key="run_diagnostic", use_container_width=True):
+        if not diagnostic_url.strip():
+            st.error("Enter a YouTube URL to run the diagnostic.")
+        else:
+            with st.status("Running end-to-end diagnostic…", expanded=True) as diagnostic_status:
+                try:
+                    diagnostic_video, diagnostic_log = run_diagnostic(diagnostic_url)
+                    for line in diagnostic_log:
+                        diagnostic_status.write(f"✓ {line}")
+                    diagnostic_status.update(label="Diagnostic passed", state="complete", expanded=False)
+                    st.video(diagnostic_video)
+                    st.download_button("Download diagnostic clip", diagnostic_video, file_name="diagnostic_vertical_captioned.mp4", mime="video/mp4", key="diagnostic_download", use_container_width=True)
+                except Exception as exc:
+                    diagnostic_status.update(label="Diagnostic failed", state="error", expanded=True)
+                    st.error(str(exc))
 
 clips = st.session_state.get("clips", [])
 if clips:
