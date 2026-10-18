@@ -98,7 +98,7 @@ def download_video(
 
         folder.mkdir(parents=True, exist_ok=True)
         output_template = str(folder / "source.%(ext)s")
-        clients = ["tv", "tv_embedded", "ios", "android", "web_safari", "web"]
+        clients = ["ios", "android", "web_safari", "default"]
 
         # PO tokens are video/session-specific and should come from a maintained provider.
         # Configure these as Streamlit secrets or environment variables; never hard-code them.
@@ -144,26 +144,33 @@ def download_video(
             common_options["download_ranges"] = lambda _info, _ydl: [{"start_time": 0, "end_time": max_seconds}]
             common_options["force_keyframes_at_cuts"] = True
 
-        for client in clients:
-            # Remove partial output from a previous failed client attempt.
-            for old_file in folder.glob("source.*"):
-                if old_file.is_file():
-                    old_file.unlink()
-            options = {
-                **common_options,
-                "extractor_args": {"youtube": {"player_client": [client]}},
-            }
-            if token and client == token_client:
-                options["extractor_args"]["youtube"]["po_token"] = [f"{client}.gvs+{token}"]
-            try:
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(url.strip(), download=True)
-                candidates = [p for p in folder.glob("source.*") if p.suffix.lower() not in {".part", ".ytdl"}]
-                if candidates:
-                    return candidates[0], str(info.get("title") or "YouTube video")
-                raise RuntimeError(f"yt-dlp client '{client}' completed without producing a video file.")
-            except Exception:
-                traces.append(f"Client '{client}' failed:\n{traceback.format_exc()}")
+        # Try the requested client set first, then each client independently. This
+        # keeps yt-dlp's extractor fallback while still recovering from a client
+        # that is unsupported or blocked on a particular host.
+        client_strategies = [clients, *[[client] for client in clients]]
+        for strategy in client_strategies:
+            for attempt in range(3):
+                # Remove partial output from a previous failed attempt.
+                for old_file in folder.glob("source.*"):
+                    if old_file.is_file():
+                        old_file.unlink()
+                options = {
+                    **common_options,
+                    "extractor_args": {"youtube": {"player_client": strategy}},
+                }
+                if token and token_client in strategy:
+                    options["extractor_args"]["youtube"]["po_token"] = [f"{token_client}.gvs+{token}"]
+                try:
+                    with yt_dlp.YoutubeDL(options) as ydl:
+                        info = ydl.extract_info(url.strip(), download=True)
+                    candidates = [p for p in folder.glob("source.*") if p.suffix.lower() not in {".part", ".ytdl"}]
+                    if candidates:
+                        return candidates[0], str(info.get("title") or "YouTube video")
+                    raise RuntimeError(f"yt-dlp clients {strategy!r} completed without producing a video file.")
+                except Exception:
+                    traces.append(f"Clients {strategy!r}, attempt {attempt + 1} failed:\n{traceback.format_exc()}")
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
 
         error_text = "\n\n".join(traces)
         is_403 = any("403" in item or "forbidden" in item.lower() for item in traces)
@@ -340,14 +347,29 @@ def subtitle_events(segments: list[dict[str, Any]], start: float, end: float) ->
                         tokens.append({"word": piece, "start": seg["start"] + span * i / len(pieces), "end": seg["start"] + span * (i + 1) / len(pieces)})
 
     events: list[str] = []
-    # Short karaoke lines keep captions readable on phone screens.
-    for idx in range(0, len(tokens), 5):
-        group = tokens[idx:idx + 5]
-        if not group:
-            continue
+    # Keep each karaoke event to one compact line and shrink unusually long
+    # lines to fit the render width with a seven percent side safe area.
+    groups: list[list[dict[str, Any]]] = []
+    group: list[dict[str, Any]] = []
+    line_length = 0
+    for token in tokens:
+        token_length = len(token["word"]) + (1 if group else 0)
+        if group and (len(group) >= 5 or line_length + token_length > 26):
+            groups.append(group)
+            group, line_length = [], 0
+            token_length = len(token["word"])
+        group.append(token)
+        line_length += token_length
+    if group:
+        groups.append(group)
+
+    for group in groups:
         local_start = max(0.0, group[0]["start"] - start)
         local_end = min(end - start, max(group[-1]["end"] - start, local_start + 0.35))
         karaoke = []
+        longest_line = sum(len(item["word"]) for item in group) + len(group) - 1
+        font_size = max(24, min(58, int((OUTPUT_WIDTH * 0.86) / max(1, 0.58 * longest_line))))
+        karaoke.append(f"{{\\fs{font_size}}}")
         for word in group:
             centiseconds = max(1, round((word["end"] - word["start"]) * 100))
             escaped = word["word"].replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
@@ -356,21 +378,27 @@ def subtitle_events(segments: list[dict[str, Any]], start: float, end: float) ->
     return events
 
 
-def write_ass(path: Path, events: list[str]) -> None:
+def write_ass(path: Path, events: list[str], width: int = OUTPUT_WIDTH, height: int = OUTPUT_HEIGHT) -> None:
+    # Font size and safe margins follow the actual render size. Caption groups
+    # are additionally scaled to fit their longest line inside the safe width.
+    font_size = max(26, min(58, int(width * 0.075)))
+    margin_horizontal = max(24, int(width * 0.07))
+    margin_vertical = max(96, int(height * 0.12))
     header = """[Script Info]
 ScriptType: v4.00+
-PlayResX: 720
-PlayResY: 1280
-WrapStyle: 2
+PlayResX: {width}
+PlayResY: {height}
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,Arial,55,&H00FFFFFF,&H0000D7FF,&H00101010,&H99000000,-1,0,0,0,100,100,0,0,1,3,1,2,48,48,225,1
+Style: Caption,Arial,{font_size},&H00FFFFFF,&H0000D7FF,&H00101010,&H99000000,-1,0,0,0,100,100,0,0,1,3,1,2,{margin_horizontal},{margin_horizontal},{margin_vertical},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+""".format(width=width, height=height, font_size=font_size,
+           margin_horizontal=margin_horizontal, margin_vertical=margin_vertical)
     path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
 
@@ -379,16 +407,80 @@ def ffmpeg_filter_path(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
 
 
-def make_clip(ffmpeg: str, video: Path, segments: list[dict[str, Any]], match: dict[str, Any], index: int, folder: Path) -> Path:
+def probe_input_video(ffmpeg: str, video: Path) -> dict[str, Any]:
+    """Fail early on unreadable files or files without usable video/audio streams."""
+    if not video.is_file() or video.stat().st_size == 0:
+        raise RuntimeError("The downloaded video file is missing or empty.")
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(video)],
+            capture_output=True, text=True, timeout=45,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"FFprobe could not read the downloaded video: {(result.stderr or '').strip()[-1500:]}")
+        try:
+            metadata = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("FFprobe returned invalid metadata for the downloaded video.") from exc
+        streams = metadata.get("streams", [])
+        video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), None)
+        audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+        if not video_stream or not audio_stream:
+            raise RuntimeError("The downloaded input must contain both a video stream and an audio stream.")
+        duration = float(metadata.get("format", {}).get("duration") or 0)
+        if duration <= 0 or not video_stream.get("width") or not video_stream.get("height"):
+            raise RuntimeError("The downloaded input has invalid dimensions or duration.")
+        return {"duration": duration, "width": int(video_stream["width"]), "height": int(video_stream["height"])}
+
+    # FFmpeg itself can inspect media when ffprobe is not installed. Exit code 1
+    # is expected because no output file was requested; the header must be valid.
+    result = subprocess.run([ffmpeg, "-hide_banner", "-i", str(video)], capture_output=True, text=True, timeout=45)
+    metadata = result.stderr or ""
+    dimensions = re.search(r"Video:.*?\b(\d{2,5})x(\d{2,5})\b", metadata, flags=re.DOTALL)
+    if not dimensions or "Audio:" not in metadata:
+        raise RuntimeError(f"FFmpeg could not find usable video and audio streams: {metadata.strip()[-1500:]}")
+    return {"duration": None, "width": int(dimensions.group(1)), "height": int(dimensions.group(2))}
+
+
+def make_clip(
+    ffmpeg: str,
+    video: Path,
+    segments: list[dict[str, Any]],
+    match: dict[str, Any],
+    index: int,
+    folder: Path,
+    layout: str = "Blurred Background (Padded) [DEFAULT]",
+) -> Path:
     start, end = float(match["start"]), float(match["end"])
+    if start < 0 or end <= start:
+        raise ValueError("The selected clip has an invalid time range.")
+    input_info = probe_input_video(ffmpeg, video)
+    if input_info["duration"] is not None and end > input_info["duration"] + 0.5:
+        raise ValueError("The selected clip ends after the downloaded video duration.")
     ass_path = folder / f"captions_{index:02d}.ass"
     output = folder / f"clip_{index:02d}.mp4"
     events = subtitle_events(segments, start, end)
     if not events or not any(r"\kf" in event for event in events):
         raise RuntimeError("No timed caption events were available for this clip; Whisper must return speech timestamps.")
     write_ass(ass_path, events)
-    vf = f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,subtitles='{ffmpeg_filter_path(ass_path)}'"
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{end-start:.3f}", "-vf", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-maxrate", "2500k", "-bufsize", "5000k", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)]
+    subtitle_filter = f"subtitles='{ffmpeg_filter_path(ass_path)}'"
+    if layout == "Blurred Background (Padded) [DEFAULT]":
+        vf = (
+            f"split=2[background][foreground];"
+            f"[background]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase:force_divisible_by=2,"
+            f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},gblur=sigma=32[bg];"
+            f"[foreground]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,{subtitle_filter}[outv]"
+        )
+    elif layout == "Smart Center Crop":
+        vf = (
+            f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase:force_divisible_by=2,"
+            f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,{subtitle_filter}[outv]"
+        )
+    else:
+        raise ValueError(f"Unsupported vertical layout: {layout}")
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", str(video), "-t", f"{end-start:.3f}", "-filter_complex", vf, "-map", "[outv]", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24", "-maxrate", "2500k", "-bufsize", "5000k", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=20 * 60)
     if result.returncode != 0 or not output.exists() or output.stat().st_size == 0:
         detail = (result.stderr or "FFmpeg did not create an output file.").strip()[-2500:]
@@ -464,7 +556,10 @@ def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
         return clip.read_bytes(), log
 
 
-def run_workflow(url: str, topic: str, api_key: str, use_openai: bool, model: str, device: str, clip_count: int, clip_duration: int) -> None:
+def run_workflow(
+    url: str, topic: str, api_key: str, use_openai: bool, model: str,
+    device: str, clip_count: int, clip_duration: int, layout: str,
+) -> None:
     progress_bar = st.progress(0)
     status = st.status("Starting…", expanded=True)
     messages = st.empty()
@@ -483,12 +578,12 @@ def run_workflow(url: str, topic: str, api_key: str, use_openai: bool, model: st
         with tempfile.TemporaryDirectory(prefix="local_clipper_") as temp:
             folder = Path(temp)
             with status:
-                status.update(label="Downloading video…", state="running")
+                status.update(label="[1/4] Downloading YouTube Stream", state="running")
                 video, title = download_video(url, folder, update_download)
                 progress_bar.progress(0.2)
                 status.write(f"Downloaded: {title}")
 
-                status.update(label="Transcribing speech…", state="running")
+                status.update(label="[2/4] Transcribing Audio & Identifying Highlights", state="running")
                 device_name = device
                 if device == "cuda":
                     try:
@@ -501,9 +596,7 @@ def run_workflow(url: str, topic: str, api_key: str, use_openai: bool, model: st
                 if not any(s["text"] for s in segments):
                     raise RuntimeError("Whisper did not detect speech in this video.")
                 progress_bar.progress(0.62)
-                status.write(f"Transcribed {len(segments)} speech segments.")
-
-                status.update(label="Finding topic moments…", state="running")
+                status.write(f"Transcribed {len(segments)} speech segments; identifying topic highlights.")
                 matches = openai_topic_matches(segments, topic, api_key, clip_count, clip_duration) if use_openai else local_topic_matches(segments, topic, clip_count, clip_duration)
                 progress_bar.progress(0.72)
                 if not matches:
@@ -512,13 +605,15 @@ def run_workflow(url: str, topic: str, api_key: str, use_openai: bool, model: st
 
                 clips = []
                 for i, match in enumerate(matches, 1):
-                    status.update(label=f"Rendering clip {i} of {len(matches)}…", state="running")
-                    path = make_clip(ffmpeg, video, segments, match, i, folder)
+                    status.update(label=f"[3/4] Rendering 9:16 Clips with FFmpeg ({i}/{len(matches)})", state="running")
+                    path = make_clip(ffmpeg, video, segments, match, i, folder, layout)
+                    verify_vertical_caption_clip(ffmpeg, path, folder / f"captions_{i:02d}.ass")
                     clips.append({"bytes": path.read_bytes(), "start": match["start"], "end": match["end"], "reason": match["reason"], "name": f"{clean_filename(topic)}_{i:02d}.mp4"})
                     progress_bar.progress(0.72 + 0.28 * i / len(matches))
             st.session_state["clips"] = clips
             st.session_state["video_title"] = title
-            status.update(label="Finished", state="complete", expanded=False)
+            progress_bar.progress(1.0)
+            status.update(label="[4/4] Complete", state="complete", expanded=False)
     except Exception as exc:
         status.update(label="Could not complete the workflow", state="error")
         if not isinstance(exc, VideoDownloadError):
@@ -540,6 +635,12 @@ with st.form("clipper_form", clear_on_submit=False):
     with col2:
         clip_count = st.slider("Maximum clips", min_value=1, max_value=MAX_CLIPS, value=3)
         clip_duration = st.slider("Maximum clip length (seconds)", min_value=10, max_value=MAX_CLIP_SECONDS, value=40)
+    layout = st.radio(
+        "Vertical framing",
+        ["Blurred Background (Padded) [DEFAULT]", "Smart Center Crop"],
+        index=0,
+        help="Blurred background keeps the entire source frame visible. Smart center crop fills the vertical frame by trimming the sides.",
+    )
     submitted = st.form_submit_button("Find and create clips", type="primary", use_container_width=True)
 
 if submitted:
@@ -556,7 +657,7 @@ if submitted:
                 chosen_device = "cpu"
         else:
             chosen_device = device
-        run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration)
+        run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration, layout)
 
 with st.expander("Run end-to-end diagnostic"):
     st.write("Downloads the first 12 seconds of a public YouTube video, transcribes it with Whisper tiny on CPU, and renders a vertical sample with word-timed captions. This uses the same downloader and FFmpeg rendering path as clip creation.")
