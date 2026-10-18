@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import re
@@ -43,13 +45,11 @@ MAX_CLIPS = 5
 MAX_CLIP_SECONDS = 60
 OUTPUT_WIDTH = 720
 OUTPUT_HEIGHT = 1280
-MAX_UPLOADED_COOKIE_BYTES = 2 * 1024 * 1024
 
-LOCAL_DOWNLOAD_GUIDANCE = (
-    "YouTube returned HTTP 403 from the app host. On Streamlit Community Cloud this commonly means "
-    "the shared datacenter IP is being blocked; changing request headers cannot reliably fix that. "
-    "If you are using Community Cloud, run the app on your own computer instead: install FFmpeg, open a terminal in the app folder, "
-    "run `python -m pip install -r requirements.txt`, then run `streamlit run app.py`."
+CLOUD_DOWNLOAD_GUIDANCE = (
+    "YouTube rejected the download from this hosting environment (HTTP 403). The app tried its configured yt-dlp client fallbacks "
+    "and any Streamlit Secrets authentication. A datacenter IP restriction cannot be reliably cleared by changing extractor options; "
+    "cookies and PO tokens only help when the failure is actually authentication or token related."
 )
 
 
@@ -97,6 +97,67 @@ def server_setting(name: str, default: str = "") -> str:
         return str(st.secrets.get(name, default)).strip()
     except Exception:
         return default
+
+
+# Read downloader authentication/configuration once when Streamlit starts the app.
+# Secrets stay server-side; cookies are materialized only inside each run's temp dir.
+YTDLP_COOKIE_SECRET = server_setting("YTDLP_COOKIES")
+YTDLP_COOKIE_SECRET_B64 = server_setting("YTDLP_COOKIES_B64")
+YTDLP_PO_TOKEN_SECRET = server_setting("YTDLP_PO_TOKEN")
+YTDLP_PO_TOKEN_CLIENT_SECRET = server_setting("YTDLP_PO_TOKEN_CLIENT", "mweb") or "mweb"
+YTDLP_PLAYER_CLIENTS_SECRET = server_setting("YTDLP_PLAYER_CLIENTS")
+
+
+def write_secret_cookie_file(folder: Path) -> Path | None:
+    """Materialize Netscape cookies from Streamlit Secrets into a private temp file."""
+    if YTDLP_COOKIE_SECRET and YTDLP_COOKIE_SECRET_B64:
+        raise ValueError("Configure either YTDLP_COOKIES or YTDLP_COOKIES_B64, not both.")
+
+    if YTDLP_COOKIE_SECRET:
+        cookie_bytes = YTDLP_COOKIE_SECRET.encode("utf-8")
+    elif YTDLP_COOKIE_SECRET_B64:
+        try:
+            cookie_bytes = base64.b64decode(YTDLP_COOKIE_SECRET_B64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("YTDLP_COOKIES_B64 must contain valid base64-encoded Netscape cookies.") from exc
+    else:
+        return None
+
+    text = cookie_bytes.decode("utf-8-sig", errors="strict")
+    has_cookie_record = any(
+        line.strip() and (not line.lstrip().startswith("#") or line.lstrip().startswith("#HttpOnly_"))
+        for line in text.splitlines()
+    )
+    if not has_cookie_record:
+        raise ValueError("The configured YouTube cookie secret is empty or is not a Netscape-format cookies export.")
+    cookie_bytes = text.encode("utf-8")
+    folder.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="wb", prefix="youtube_cookies_", suffix=".txt", dir=folder, delete=False
+    ) as cookie_file:
+        cookie_file.write(cookie_bytes)
+        cookie_path = Path(cookie_file.name)
+    try:
+        os.chmod(cookie_path, 0o600)
+    except OSError:
+        # The temporary directory already has restrictive inherited permissions on Windows.
+        pass
+    return cookie_path
+
+
+def youtube_client_strategies() -> list[list[str]]:
+    """Build supported yt-dlp player-client fallbacks, optionally ordered by Secrets."""
+    supported = {"ios", "android", "web_safari", "default", "web_embedded", "mweb", "web", "visionos"}
+    configured = [part.strip() for part in YTDLP_PLAYER_CLIENTS_SECRET.split(",") if part.strip()]
+    if configured:
+        invalid = [client for client in configured if client not in supported]
+        if invalid:
+            raise ValueError(f"Unsupported YTDLP_PLAYER_CLIENTS value(s): {', '.join(invalid)}")
+        return [[client] for client in dict.fromkeys(configured)]
+    return [
+        ["ios"], ["android"], ["web_safari"], ["default"],
+        ["web_embedded", "mweb"], ["web"], ["visionos"],
+    ]
 
 
 def configured_instances(setting_name: str, defaults: tuple[str, ...]) -> list[str]:
@@ -260,7 +321,7 @@ def download_video(
     folder: Path,
     progress: Any,
     max_seconds: int | None = None,
-    cookie_file_override: str | Path | None = None,
+    cookie_file: str | Path | None = None,
 ) -> tuple[Path, str]:
     traces: list[str] = []
     try:
@@ -268,26 +329,13 @@ def download_video(
 
         folder.mkdir(parents=True, exist_ok=True)
         output_template = str(folder / "source.%(ext)s")
-        clients = ["default", "ios", "android", "web_safari"]
-
         # PO tokens are video/session-specific and should come from a maintained provider.
         # Configure these as Streamlit secrets or environment variables; never hard-code them.
-        token = server_setting("YTDLP_PO_TOKEN")
-        token_client = server_setting("YTDLP_PO_TOKEN_CLIENT", "mweb") or "mweb"
-        if token and token_client != "web_creator" and token_client not in clients:
-            clients.insert(0, token_client)
-
-        cookies_file = str(cookie_file_override) if cookie_file_override is not None else server_setting("YTDLP_COOKIES_FILE")
-        cookies_content = server_setting("YTDLP_COOKIES") if cookie_file_override is None else ""
-        if cookie_file_override is not None and not Path(cookie_file_override).is_file():
-            raise FileNotFoundError("The uploaded cookie file is no longer available. Please upload it again.")
-        if cookies_content and cookie_file_override is None:
-            # Useful on hosted services where the cookie file itself cannot be mounted.
-            cookies_path = folder / "youtube_cookies.txt"
-            cookies_path.write_text(cookies_content, encoding="utf-8")
-            cookies_file = str(cookies_path)
+        token = YTDLP_PO_TOKEN_SECRET
+        token_client = YTDLP_PO_TOKEN_CLIENT_SECRET
+        cookies_file = str(cookie_file) if cookie_file is not None else ""
         if cookies_file and not Path(cookies_file).is_file():
-            raise FileNotFoundError("YTDLP_COOKIES_FILE is set, but that cookie file does not exist on this server.")
+            raise FileNotFoundError("The configured YouTube cookie secret is unavailable in the temporary download directory.")
 
         common_options: dict[str, Any] = {
             "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
@@ -318,16 +366,13 @@ def download_video(
 
         # Try the default/mobile clients, then alternate web client groups. This
         # recovers when one extractor client is unsupported or rate-limited.
-        client_strategies = [
-            clients,
-            ["web_embedded", "mweb"],
-            ["web", "web_safari"],
-            ["visionos"],
-        ]
+        client_strategies = youtube_client_strategies()
+        if token and token_client != "web_creator" and token_client not in {c for group in client_strategies for c in group}:
+            client_strategies.insert(0, [token_client])
         # WEB_CREATOR is authentication-only and its downloadable formats need
         # a PO token; never add it to anonymous or partially configured runs.
         if cookies_file and token and token_client == "web_creator":
-            client_strategies.append(["web_creator"])
+            client_strategies.insert(0, ["web_creator"])
         for strategy in client_strategies:
             for attempt in range(3):
                 # Remove partial output from a previous failed attempt.
@@ -366,10 +411,10 @@ def download_video(
 
         error_text = "\n\n".join(traces + [f"Mirror fallback: {note}" for note in mirror_notes])
         is_403 = any("403" in item or "forbidden" in item.lower() for item in traces)
-        summary = LOCAL_DOWNLOAD_GUIDANCE if is_403 else "YouTube client and configured mirror fallbacks failed. Check the trace below for the exact errors."
+        summary = CLOUD_DOWNLOAD_GUIDANCE if is_403 else "YouTube client and configured mirror fallbacks failed. Check the trace below for the exact errors."
         st.error(f"{summary}\n\n```text\n{error_text or traceback.format_exc()}\n```")
         if is_403:
-            st.info("If you administer this deployment, a supported PO Token provider may help for formats that require tokens. Configure YTDLP_PO_TOKEN and YTDLP_PO_TOKEN_CLIENT secrets. If authentication is actually needed, use YTDLP_COOKIES with a Netscape-format cookie export or YTDLP_COOKIES_FILE with a server-side file. Treat cookies like passwords. yt-dlp's YouTube OAuth login is no longer supported.")
+            st.info("If the video requires authentication, configure YTDLP_COOKIES or YTDLP_COOKIES_B64 in Streamlit Secrets with a Netscape-format cookie export. A supported PO Token provider may also help for token-required formats; configure YTDLP_PO_TOKEN and YTDLP_PO_TOKEN_CLIENT. Treat cookies like passwords. yt-dlp's YouTube OAuth login is no longer supported.")
         raise VideoDownloadError(summary)
     except VideoDownloadError:
         raise
@@ -716,49 +761,27 @@ def verify_vertical_caption_clip(ffmpeg: str, clip: Path, ass_path: Path) -> Non
         raise RuntimeError(f"Expected a {OUTPUT_WIDTH}×{OUTPUT_HEIGHT} vertical clip; got {width}×{height}.")
 
 
-def stage_uploaded_cookies(folder: Path, cookie_bytes: bytes | None) -> Path | None:
-    """Store this run's cookie upload in its private, automatically cleaned temp folder."""
-    if cookie_bytes is None:
-        return None
-    if not cookie_bytes:
-        raise ValueError("The uploaded cookies.txt file is empty.")
-    if len(cookie_bytes) > MAX_UPLOADED_COOKIE_BYTES:
-        raise ValueError("cookies.txt must be 2 MB or smaller.")
-    with tempfile.NamedTemporaryFile(
-        mode="wb", prefix="youtube_cookies_", suffix=".txt", dir=folder, delete=False
-    ) as cookie_file:
-        cookie_file.write(cookie_bytes)
-        cookie_path = Path(cookie_file.name)
-    try:
-        os.chmod(cookie_path, 0o600)
-    except OSError:
-        # Windows permissions are inherited from the temporary directory.
-        pass
-    return cookie_path
-
-
-def run_diagnostic(youtube_url: str, uploaded_cookies: bytes | None = None) -> tuple[bytes, list[str]]:
+def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
     """Run a small end-to-end downloader, Whisper, crop and caption smoke check."""
     validate_youtube_url(youtube_url)
     ffmpeg = require_ffmpeg()
     log = ["URL validation passed.", "FFmpeg is available."]
     with tempfile.TemporaryDirectory(prefix="clipper_diagnostic_") as temp:
         folder = Path(temp)
-        cookie_path = stage_uploaded_cookies(folder, uploaded_cookies)
+        cookie_path = write_secret_cookie_file(folder)
         try:
-            try:
-                video, title = download_video(
-                    youtube_url, folder, lambda _data: None, max_seconds=12, cookie_file_override=cookie_path
-                )
-            finally:
-                if cookie_path is not None:
-                    cookie_path.unlink(missing_ok=True)
+            video, title = download_video(
+                youtube_url, folder, lambda _data: None, max_seconds=12, cookie_file=cookie_path
+            )
         except VideoDownloadError:
             raise
         except Exception as exc:
             if "403" in str(exc) or "forbidden" in str(exc).lower():
                 raise RuntimeError(f"Diagnostic download was blocked with HTTP 403 after all configured YouTube client fallbacks: {exc}") from exc
             raise
+        finally:
+            if cookie_path is not None and cookie_path.parent == folder:
+                cookie_path.unlink(missing_ok=True)
         log.append(f"YouTube snippet download passed ({title}).")
         segments = transcribe(video, "tiny", "cpu", lambda _progress, _message: None)
         word_count = sum(len(segment["words"]) for segment in segments)
@@ -779,7 +802,6 @@ def run_diagnostic(youtube_url: str, uploaded_cookies: bytes | None = None) -> t
 def run_workflow(
     url: str, topic: str, api_key: str, use_openai: bool, model: str,
     device: str, clip_count: int, clip_duration: int, layout: str,
-    uploaded_cookies: bytes | None = None,
 ) -> None:
     progress_bar = st.progress(0)
     status = st.status("Starting…", expanded=True)
@@ -798,13 +820,13 @@ def run_workflow(
         ffmpeg = require_ffmpeg()
         with tempfile.TemporaryDirectory(prefix="local_clipper_") as temp:
             folder = Path(temp)
-            cookie_path = stage_uploaded_cookies(folder, uploaded_cookies)
+            cookie_path = write_secret_cookie_file(folder)
             with status:
                 status.update(label="[1/4] Downloading YouTube Stream", state="running")
                 try:
-                    video, title = download_video(url, folder, update_download, cookie_file_override=cookie_path)
+                    video, title = download_video(url, folder, update_download, cookie_file=cookie_path)
                 finally:
-                    if cookie_path is not None:
+                    if cookie_path is not None and cookie_path.parent == folder:
                         cookie_path.unlink(missing_ok=True)
                 progress_bar.progress(0.2)
                 status.write(f"Downloaded: {title}")
@@ -850,12 +872,8 @@ st.title("✂️ Local AI Video Clipper")
 st.caption("Find topic moments, crop them to vertical 9:16, and burn in word-timed subtitles.")
 
 with st.sidebar:
-    st.subheader("YouTube authentication")
-    uploaded_cookie_file = st.file_uploader(
-        "Upload cookies.txt", type=["txt"], key="youtube_cookie_upload",
-        help="Optional Netscape-format YouTube cookies file for videos that require sign-in.",
-    )
-    st.caption("Cookies are used only for YouTube downloads during this run and removed with temporary files. Treat this file like a password.")
+    has_youtube_auth = bool(YTDLP_COOKIE_SECRET or YTDLP_COOKIE_SECRET_B64)
+    st.caption("YouTube authentication: configured in Streamlit Secrets." if has_youtube_auth else "YouTube authentication: no cookie secret configured.")
 
 with st.form("clipper_form", clear_on_submit=False):
     youtube_url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=…")
@@ -891,11 +909,7 @@ if submitted:
                 chosen_device = "cpu"
         else:
             chosen_device = device
-        uploaded_cookies = uploaded_cookie_file.getvalue() if uploaded_cookie_file is not None else None
-        if uploaded_cookies is not None and len(uploaded_cookies) > MAX_UPLOADED_COOKIE_BYTES:
-            st.error("cookies.txt must be 2 MB or smaller.")
-        else:
-            run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration, layout, uploaded_cookies)
+        run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration, layout)
 
 with st.expander("Run end-to-end diagnostic"):
     st.write("Downloads the first 12 seconds of a public YouTube video, transcribes it with Whisper tiny on CPU, and renders a vertical sample with word-timed captions. This uses the same downloader and FFmpeg rendering path as clip creation.")
@@ -906,10 +920,7 @@ with st.expander("Run end-to-end diagnostic"):
         else:
             with st.status("Running end-to-end diagnostic…", expanded=True) as diagnostic_status:
                 try:
-                    uploaded_cookies = uploaded_cookie_file.getvalue() if uploaded_cookie_file is not None else None
-                    if uploaded_cookies is not None and len(uploaded_cookies) > MAX_UPLOADED_COOKIE_BYTES:
-                        raise ValueError("cookies.txt must be 2 MB or smaller.")
-                    diagnostic_video, diagnostic_log = run_diagnostic(diagnostic_url, uploaded_cookies)
+                    diagnostic_video, diagnostic_log = run_diagnostic(diagnostic_url)
                     for line in diagnostic_log:
                         diagnostic_status.write(f"✓ {line}")
                     diagnostic_status.update(label="Diagnostic passed", state="complete", expanded=False)
