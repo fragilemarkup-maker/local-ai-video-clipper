@@ -1,0 +1,8 @@
+/bin/
+/venv/
+/.venv/
+/ffmpeg-release-essentials.zip
+/.ffmpeg_essentials_*.zip
+/.ffmpeg_parts_*/
+/.ffmpeg_probe.bin
+__pycache__/

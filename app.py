@@ -14,6 +14,24 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# Prefer project-local FFmpeg binaries without requiring a machine-wide PATH change.
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOCAL_FFMPEG_BIN = PROJECT_ROOT / "bin"
+
+
+def add_local_ffmpeg_to_path() -> None:
+    """Expose project-local FFmpeg to subprocesses without editing system PATH."""
+    if not LOCAL_FFMPEG_BIN.is_dir():
+        return
+    local_path = os.path.normcase(str(LOCAL_FFMPEG_BIN.resolve()))
+    existing = os.environ.get("PATH", "")
+    entries = {os.path.normcase(os.path.abspath(entry)) for entry in existing.split(os.pathsep) if entry}
+    if local_path not in entries:
+        os.environ["PATH"] = str(LOCAL_FFMPEG_BIN.resolve()) + os.pathsep + existing
+
+
+add_local_ffmpeg_to_path()
+
 import streamlit as st
 
 
@@ -42,6 +60,7 @@ def clean_filename(value: str) -> str:
 
 
 def require_ffmpeg() -> str:
+    add_local_ffmpeg_to_path()
     executable = shutil.which("ffmpeg")
     if not executable:
         raise RuntimeError("FFmpeg was not found. Install FFmpeg and ensure `ffmpeg` is on PATH.")
@@ -385,22 +404,32 @@ def verify_vertical_caption_clip(ffmpeg: str, clip: Path, ass_path: Path) -> Non
     if "[Events]" not in subtitle_text or "Dialogue:" not in subtitle_text or r"\kf" not in subtitle_text:
         raise RuntimeError("Caption verification failed: no word-timed subtitle events were rendered.")
     ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        raise RuntimeError("ffprobe was not found, so the rendered clip could not be verified.")
-    result = subprocess.run(
-        [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(clip)],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Could not inspect the rendered clip: {(result.stderr or '').strip()}")
-    try:
-        stream = json.loads(result.stdout)["streams"][0]
-    except (KeyError, IndexError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Could not read video dimensions from the rendered clip.") from exc
-    if (stream.get("width"), stream.get("height")) != (OUTPUT_WIDTH, OUTPUT_HEIGHT):
-        raise RuntimeError(f"Expected a {OUTPUT_WIDTH}×{OUTPUT_HEIGHT} vertical clip; got {stream.get('width')}×{stream.get('height')}.")
+    if ffprobe:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(clip)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not inspect the rendered clip: {(result.stderr or '').strip()}")
+        try:
+            stream = json.loads(result.stdout)["streams"][0]
+        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Could not read video dimensions from the rendered clip.") from exc
+        width, height = stream.get("width"), stream.get("height")
+    else:
+        # imageio-ffmpeg bundles FFmpeg without ffprobe; its input report still
+        # exposes the encoded video dimensions and allows local verification.
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(clip)], capture_output=True, text=True, timeout=30
+        )
+        dimensions = re.search(r"Video:.*?\b(\d{2,5})x(\d{2,5})\b", result.stderr, flags=re.DOTALL)
+        if not dimensions:
+            raise RuntimeError(f"Could not read video dimensions from FFmpeg: {(result.stderr or '').strip()[-1200:]}")
+        width, height = map(int, dimensions.groups())
+    if (width, height) != (OUTPUT_WIDTH, OUTPUT_HEIGHT):
+        raise RuntimeError(f"Expected a {OUTPUT_WIDTH}×{OUTPUT_HEIGHT} vertical clip; got {width}×{height}.")
 
 
 def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
