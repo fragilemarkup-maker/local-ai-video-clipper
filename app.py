@@ -11,6 +11,8 @@ import tempfile
 import textwrap
 import time
 import traceback
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import Request, urlopen
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +56,16 @@ class VideoDownloadError(RuntimeError):
     """A download failure that has already been displayed with its diagnostic trace."""
 
 
+DEFAULT_INVIDIOUS_INSTANCES = (
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://yt.chocolatemoo53.com",
+    "https://invidious.tiekoetter.com",
+)
+DEFAULT_PIPED_API_INSTANCES = ("https://pipedapi.kavin.rocks",)
+MAX_MIRROR_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+
 def clean_filename(value: str) -> str:
     value = re.sub(r"[^\w.-]+", "_", value.strip(), flags=re.UNICODE)
     return value.strip("._")[:80] or "clip"
@@ -86,6 +98,162 @@ def server_setting(name: str, default: str = "") -> str:
         return default
 
 
+def configured_instances(setting_name: str, defaults: tuple[str, ...]) -> list[str]:
+    """Read comma/newline-separated HTTPS API roots from secrets or environment."""
+    configured = server_setting(setting_name)
+    if configured.lower() in {"off", "none", "disabled"}:
+        return []
+    candidates = configured.replace("\r", "\n").replace(",", "\n").splitlines() if configured else list(defaults)
+    instances: list[str] = []
+    for candidate in candidates:
+        base = candidate.strip().rstrip("/")
+        if not base:
+            continue
+        parsed = urlsplit(base)
+        if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            continue
+        if base not in instances:
+            instances.append(base)
+    return instances[:8]
+
+
+def youtube_video_id(url: str) -> str:
+    """Extract an 11-character ID from supported YouTube URL forms."""
+    parsed = urlsplit(url.strip())
+    host = (parsed.hostname or "").lower()
+    video_id = ""
+    if host in {"youtu.be", "www.youtu.be"}:
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+    elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"}:
+        video_id = (parse_qs(parsed.query).get("v") or [""])[0]
+        if not video_id:
+            match = re.match(r"^/(?:embed|shorts|live|v)/([\w-]{11})(?:/|$)", parsed.path)
+            video_id = match.group(1) if match else ""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        raise ValueError("Could not extract a valid YouTube video ID for mirror fallback.")
+    return video_id
+
+
+def fetch_json(url: str, referer: str) -> dict[str, Any]:
+    request = Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": referer,
+    })
+    with urlopen(request, timeout=18) as response:
+        payload = response.read(3 * 1024 * 1024 + 1)
+    if len(payload) > 3 * 1024 * 1024:
+        raise RuntimeError("Mirror API response exceeded the 3 MB safety limit.")
+    decoded = json.loads(payload.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise RuntimeError("Mirror API returned an unexpected response.")
+    return decoded
+
+
+def save_remote_stream(
+    stream_url: str,
+    destination: Path,
+    referer: str,
+    progress: Any,
+    allowed_hosts: tuple[str, ...],
+) -> Path:
+    """Download a progressive video stream with timeouts, size limits and cleanup."""
+    parsed = urlsplit(stream_url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("Mirror returned an unsafe or non-HTTPS media URL.")
+    media_host = parsed.hostname.lower().rstrip(".")
+    if not any(media_host == host or media_host.endswith(f".{host}") for host in allowed_hosts):
+        raise RuntimeError("Mirror returned a media host outside the instance/CDN allowlist.")
+    request = Request(stream_url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "video/mp4,video/*,application/octet-stream;q=0.9,*/*;q=0.8",
+        "Referer": referer,
+    })
+    partial = destination.with_suffix(destination.suffix + ".part")
+    written = 0
+    try:
+        with urlopen(request, timeout=35) as response, partial.open("wb") as output:
+            media_type = response.headers.get_content_type().lower()
+            if media_type in {"text/html", "application/json", "text/plain"}:
+                raise RuntimeError(f"Mirror media endpoint returned {media_type}, not a video stream.")
+            content_length = int(response.headers.get("Content-Length") or 0)
+            if content_length > MAX_MIRROR_DOWNLOAD_BYTES:
+                raise RuntimeError("Mirror video exceeds the 2 GB fallback download limit.")
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_MIRROR_DOWNLOAD_BYTES:
+                    raise RuntimeError("Mirror video exceeded the 2 GB fallback download limit.")
+                output.write(chunk)
+                progress({"status": "downloading", "downloaded_bytes": written, "total_bytes": content_length or None})
+        if written < 64 * 1024:
+            raise RuntimeError("Mirror returned an empty or incomplete video stream.")
+        partial.replace(destination)
+        return destination
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def progressive_stream(streams: list[dict[str, Any]], height_key: str = "qualityLabel") -> dict[str, Any] | None:
+    """Select a muxed MP4 stream at or below 1080p, preferring higher resolution."""
+    candidates = []
+    for stream in streams:
+        stream_url = stream.get("url")
+        container = str(stream.get("container") or "").lower()
+        mime = str(stream.get("type") or stream.get("mimeType") or "").lower()
+        if not stream_url or stream.get("videoOnly") is True:
+            continue
+        if container and container != "mp4" and "video/mp4" not in mime:
+            continue
+        if not container and "video/mp4" not in mime:
+            continue
+        height_text = str(stream.get(height_key) or stream.get("resolution") or stream.get("quality") or "")
+        height_match = re.search(r"(\d{3,4})p?", height_text)
+        height = int(height_match.group(1)) if height_match else 360
+        if height <= 1080:
+            candidates.append((height, stream))
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def download_from_mirrors(url: str, folder: Path, progress: Any) -> tuple[Path, str, list[str]]:
+    """Try Invidious local-proxy streams, then Piped progressive streams."""
+    video_id = youtube_video_id(url)
+    errors: list[str] = []
+    invidious_instances = configured_instances("YTDLP_INVIDIOUS_INSTANCES", DEFAULT_INVIDIOUS_INSTANCES)
+    for instance in invidious_instances:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}?local=true"
+            data = fetch_json(api_url, f"{instance}/")
+            stream = progressive_stream(data.get("formatStreams") or [], "qualityLabel")
+            if not stream:
+                raise RuntimeError("Invidious returned no progressive MP4 stream.")
+            destination = folder / "source_invidious.mp4"
+            instance_host = urlsplit(instance).hostname or ""
+            path = save_remote_stream(str(stream["url"]), destination, f"{instance}/", progress, (instance_host, "googlevideo.com"))
+            return path, str(data.get("title") or "YouTube video (Invidious)"), errors
+        except Exception as exc:
+            errors.append(f"Invidious {instance}: {type(exc).__name__}: {exc}")
+
+    piped_instances = configured_instances("YTDLP_PIPED_API_INSTANCES", DEFAULT_PIPED_API_INSTANCES)
+    for instance in piped_instances:
+        try:
+            data = fetch_json(f"{instance}/streams/{video_id}", f"{instance}/")
+            stream = progressive_stream(data.get("videoStreams") or [], "quality")
+            if not stream:
+                raise RuntimeError("Piped returned no progressive MP4 stream.")
+            destination = folder / "source_piped.mp4"
+            instance_host = urlsplit(instance).hostname or ""
+            path = save_remote_stream(str(stream["url"]), destination, f"{instance}/", progress, (instance_host, "googlevideo.com"))
+            return path, str(data.get("title") or "YouTube video (Piped)"), errors
+        except Exception as exc:
+            errors.append(f"Piped {instance}: {type(exc).__name__}: {exc}")
+    if not invidious_instances and not piped_instances:
+        errors.append("All Invidious and Piped fallbacks are disabled in server settings.")
+    return Path(), "", errors
+
+
 def download_video(
     url: str,
     folder: Path,
@@ -98,13 +266,13 @@ def download_video(
 
         folder.mkdir(parents=True, exist_ok=True)
         output_template = str(folder / "source.%(ext)s")
-        clients = ["ios", "android", "web_safari", "default"]
+        clients = ["default", "ios", "android", "web_safari"]
 
         # PO tokens are video/session-specific and should come from a maintained provider.
         # Configure these as Streamlit secrets or environment variables; never hard-code them.
         token = server_setting("YTDLP_PO_TOKEN")
         token_client = server_setting("YTDLP_PO_TOKEN_CLIENT", "mweb") or "mweb"
-        if token and token_client not in clients:
+        if token and token_client != "web_creator" and token_client not in clients:
             clients.insert(0, token_client)
 
         cookies_file = server_setting("YTDLP_COOKIES_FILE")
@@ -144,10 +312,18 @@ def download_video(
             common_options["download_ranges"] = lambda _info, _ydl: [{"start_time": 0, "end_time": max_seconds}]
             common_options["force_keyframes_at_cuts"] = True
 
-        # Try the requested client set first, then each client independently. This
-        # keeps yt-dlp's extractor fallback while still recovering from a client
-        # that is unsupported or blocked on a particular host.
-        client_strategies = [clients, *[[client] for client in clients]]
+        # Try the default/mobile clients, then alternate web client groups. This
+        # recovers when one extractor client is unsupported or rate-limited.
+        client_strategies = [
+            clients,
+            ["web_embedded", "mweb"],
+            ["web", "web_safari"],
+            ["visionos"],
+        ]
+        # WEB_CREATOR is authentication-only and its downloadable formats need
+        # a PO token; never add it to anonymous or partially configured runs.
+        if cookies_file and token and token_client == "web_creator":
+            client_strategies.append(["web_creator"])
         for strategy in client_strategies:
             for attempt in range(3):
                 # Remove partial output from a previous failed attempt.
@@ -172,9 +348,21 @@ def download_video(
                     if attempt < 2:
                         time.sleep(2 ** attempt)
 
-        error_text = "\n\n".join(traces)
+        mirror_notes: list[str] = []
+        if max_seconds is None:
+            try:
+                mirror_path, mirror_title, mirror_errors = download_from_mirrors(url, folder, progress)
+                if mirror_path.is_file():
+                    return mirror_path, mirror_title
+                mirror_notes = mirror_errors
+            except Exception:
+                mirror_notes = [f"Mirror fallback setup failed:\n{traceback.format_exc()}"]
+        else:
+            mirror_notes = ["Mirror fallback skipped for snippet-only diagnostic downloads."]
+
+        error_text = "\n\n".join(traces + [f"Mirror fallback: {note}" for note in mirror_notes])
         is_403 = any("403" in item or "forbidden" in item.lower() for item in traces)
-        summary = LOCAL_DOWNLOAD_GUIDANCE if is_403 else "All configured YouTube download clients failed. Check the trace below for the exact yt-dlp errors."
+        summary = LOCAL_DOWNLOAD_GUIDANCE if is_403 else "YouTube client and configured mirror fallbacks failed. Check the trace below for the exact errors."
         st.error(f"{summary}\n\n```text\n{error_text or traceback.format_exc()}\n```")
         if is_403:
             st.info("If you administer this deployment, a supported PO Token provider may help for formats that require tokens. Configure YTDLP_PO_TOKEN and YTDLP_PO_TOKEN_CLIENT secrets. If authentication is actually needed, use YTDLP_COOKIES with a Netscape-format cookie export or YTDLP_COOKIES_FILE with a server-side file. Treat cookies like passwords. yt-dlp's YouTube OAuth login is no longer supported.")
@@ -691,4 +879,5 @@ if clips:
 
 with st.expander("Privacy and runtime notes"):
     st.write("Video download, transcription, cropping, and subtitle rendering run on the machine hosting this app. The video is not uploaded to OpenAI. If enabled, only the timestamped transcript and topic are sent to OpenAI for matching. Temporary source files are removed when processing ends; generated clips remain in this browser session for download.")
+    st.write("If direct YouTube extraction fails, the app may query public Invidious or Piped instances for the video ID and a progressive stream. These third-party services can be unavailable or change their APIs. Set YTDLP_INVIDIOUS_INSTANCES or YTDLP_PIPED_API_INSTANCES in Streamlit secrets to choose HTTPS instances; set either value to `off` to disable that fallback type.")
     st.write("This app is intended for videos you are allowed to download and reuse. Respect the source platform's terms and the creator's rights.")
