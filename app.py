@@ -43,6 +43,7 @@ MAX_CLIPS = 5
 MAX_CLIP_SECONDS = 60
 OUTPUT_WIDTH = 720
 OUTPUT_HEIGHT = 1280
+MAX_UPLOADED_COOKIE_BYTES = 2 * 1024 * 1024
 
 LOCAL_DOWNLOAD_GUIDANCE = (
     "YouTube returned HTTP 403 from the app host. On Streamlit Community Cloud this commonly means "
@@ -259,6 +260,7 @@ def download_video(
     folder: Path,
     progress: Any,
     max_seconds: int | None = None,
+    cookie_file_override: str | Path | None = None,
 ) -> tuple[Path, str]:
     traces: list[str] = []
     try:
@@ -275,9 +277,11 @@ def download_video(
         if token and token_client != "web_creator" and token_client not in clients:
             clients.insert(0, token_client)
 
-        cookies_file = server_setting("YTDLP_COOKIES_FILE")
-        cookies_content = server_setting("YTDLP_COOKIES")
-        if cookies_content:
+        cookies_file = str(cookie_file_override) if cookie_file_override is not None else server_setting("YTDLP_COOKIES_FILE")
+        cookies_content = server_setting("YTDLP_COOKIES") if cookie_file_override is None else ""
+        if cookie_file_override is not None and not Path(cookie_file_override).is_file():
+            raise FileNotFoundError("The uploaded cookie file is no longer available. Please upload it again.")
+        if cookies_content and cookie_file_override is None:
             # Useful on hosted services where the cookie file itself cannot be mounted.
             cookies_path = folder / "youtube_cookies.txt"
             cookies_path.write_text(cookies_content, encoding="utf-8")
@@ -712,15 +716,43 @@ def verify_vertical_caption_clip(ffmpeg: str, clip: Path, ass_path: Path) -> Non
         raise RuntimeError(f"Expected a {OUTPUT_WIDTH}×{OUTPUT_HEIGHT} vertical clip; got {width}×{height}.")
 
 
-def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
+def stage_uploaded_cookies(folder: Path, cookie_bytes: bytes | None) -> Path | None:
+    """Store this run's cookie upload in its private, automatically cleaned temp folder."""
+    if cookie_bytes is None:
+        return None
+    if not cookie_bytes:
+        raise ValueError("The uploaded cookies.txt file is empty.")
+    if len(cookie_bytes) > MAX_UPLOADED_COOKIE_BYTES:
+        raise ValueError("cookies.txt must be 2 MB or smaller.")
+    with tempfile.NamedTemporaryFile(
+        mode="wb", prefix="youtube_cookies_", suffix=".txt", dir=folder, delete=False
+    ) as cookie_file:
+        cookie_file.write(cookie_bytes)
+        cookie_path = Path(cookie_file.name)
+    try:
+        os.chmod(cookie_path, 0o600)
+    except OSError:
+        # Windows permissions are inherited from the temporary directory.
+        pass
+    return cookie_path
+
+
+def run_diagnostic(youtube_url: str, uploaded_cookies: bytes | None = None) -> tuple[bytes, list[str]]:
     """Run a small end-to-end downloader, Whisper, crop and caption smoke check."""
     validate_youtube_url(youtube_url)
     ffmpeg = require_ffmpeg()
     log = ["URL validation passed.", "FFmpeg is available."]
     with tempfile.TemporaryDirectory(prefix="clipper_diagnostic_") as temp:
         folder = Path(temp)
+        cookie_path = stage_uploaded_cookies(folder, uploaded_cookies)
         try:
-            video, title = download_video(youtube_url, folder, lambda _data: None, max_seconds=12)
+            try:
+                video, title = download_video(
+                    youtube_url, folder, lambda _data: None, max_seconds=12, cookie_file_override=cookie_path
+                )
+            finally:
+                if cookie_path is not None:
+                    cookie_path.unlink(missing_ok=True)
         except VideoDownloadError:
             raise
         except Exception as exc:
@@ -747,6 +779,7 @@ def run_diagnostic(youtube_url: str) -> tuple[bytes, list[str]]:
 def run_workflow(
     url: str, topic: str, api_key: str, use_openai: bool, model: str,
     device: str, clip_count: int, clip_duration: int, layout: str,
+    uploaded_cookies: bytes | None = None,
 ) -> None:
     progress_bar = st.progress(0)
     status = st.status("Starting…", expanded=True)
@@ -765,9 +798,14 @@ def run_workflow(
         ffmpeg = require_ffmpeg()
         with tempfile.TemporaryDirectory(prefix="local_clipper_") as temp:
             folder = Path(temp)
+            cookie_path = stage_uploaded_cookies(folder, uploaded_cookies)
             with status:
                 status.update(label="[1/4] Downloading YouTube Stream", state="running")
-                video, title = download_video(url, folder, update_download)
+                try:
+                    video, title = download_video(url, folder, update_download, cookie_file_override=cookie_path)
+                finally:
+                    if cookie_path is not None:
+                        cookie_path.unlink(missing_ok=True)
                 progress_bar.progress(0.2)
                 status.write(f"Downloaded: {title}")
 
@@ -811,6 +849,14 @@ def run_workflow(
 st.title("✂️ Local AI Video Clipper")
 st.caption("Find topic moments, crop them to vertical 9:16, and burn in word-timed subtitles.")
 
+with st.sidebar:
+    st.subheader("YouTube authentication")
+    uploaded_cookie_file = st.file_uploader(
+        "Upload cookies.txt", type=["txt"], key="youtube_cookie_upload",
+        help="Optional Netscape-format YouTube cookies file for videos that require sign-in.",
+    )
+    st.caption("Cookies are used only for YouTube downloads during this run and removed with temporary files. Treat this file like a password.")
+
 with st.form("clipper_form", clear_on_submit=False):
     youtube_url = st.text_input("YouTube URL", placeholder="https://www.youtube.com/watch?v=…")
     topic_query = st.text_input("Topic or search query", placeholder="e.g. how compound interest works")
@@ -845,7 +891,11 @@ if submitted:
                 chosen_device = "cpu"
         else:
             chosen_device = device
-        run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration, layout)
+        uploaded_cookies = uploaded_cookie_file.getvalue() if uploaded_cookie_file is not None else None
+        if uploaded_cookies is not None and len(uploaded_cookies) > MAX_UPLOADED_COOKIE_BYTES:
+            st.error("cookies.txt must be 2 MB or smaller.")
+        else:
+            run_workflow(youtube_url, topic_query, api_key, use_openai, whisper_model, chosen_device, clip_count, clip_duration, layout, uploaded_cookies)
 
 with st.expander("Run end-to-end diagnostic"):
     st.write("Downloads the first 12 seconds of a public YouTube video, transcribes it with Whisper tiny on CPU, and renders a vertical sample with word-timed captions. This uses the same downloader and FFmpeg rendering path as clip creation.")
@@ -856,7 +906,10 @@ with st.expander("Run end-to-end diagnostic"):
         else:
             with st.status("Running end-to-end diagnostic…", expanded=True) as diagnostic_status:
                 try:
-                    diagnostic_video, diagnostic_log = run_diagnostic(diagnostic_url)
+                    uploaded_cookies = uploaded_cookie_file.getvalue() if uploaded_cookie_file is not None else None
+                    if uploaded_cookies is not None and len(uploaded_cookies) > MAX_UPLOADED_COOKIE_BYTES:
+                        raise ValueError("cookies.txt must be 2 MB or smaller.")
+                    diagnostic_video, diagnostic_log = run_diagnostic(diagnostic_url, uploaded_cookies)
                     for line in diagnostic_log:
                         diagnostic_status.write(f"✓ {line}")
                     diagnostic_status.update(label="Diagnostic passed", state="complete", expanded=False)
