@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import json
 import os
 import re
@@ -102,35 +100,97 @@ def server_setting(name: str, default: str = "") -> str:
 # Read downloader authentication/configuration once when Streamlit starts the app.
 # Secrets stay server-side; cookies are materialized only inside each run's temp dir.
 YTDLP_COOKIE_SECRET = server_setting("YTDLP_COOKIES")
-YTDLP_COOKIE_SECRET_B64 = server_setting("YTDLP_COOKIES_B64")
 YTDLP_PO_TOKEN_SECRET = server_setting("YTDLP_PO_TOKEN")
 YTDLP_PO_TOKEN_CLIENT_SECRET = server_setting("YTDLP_PO_TOKEN_CLIENT", "mweb") or "mweb"
 YTDLP_PLAYER_CLIENTS_SECRET = server_setting("YTDLP_PLAYER_CLIENTS")
 
 
 def write_secret_cookie_file(folder: Path) -> Path | None:
-    """Materialize Netscape cookies from Streamlit Secrets into a private temp file."""
-    if YTDLP_COOKIE_SECRET and YTDLP_COOKIE_SECRET_B64:
-        raise ValueError("Configure either YTDLP_COOKIES or YTDLP_COOKIES_B64, not both.")
-
-    if YTDLP_COOKIE_SECRET:
-        cookie_bytes = YTDLP_COOKIE_SECRET.encode("utf-8")
-    elif YTDLP_COOKIE_SECRET_B64:
-        try:
-            cookie_bytes = base64.b64decode(YTDLP_COOKIE_SECRET_B64, validate=True)
-        except (binascii.Error, ValueError) as exc:
-            raise ValueError("YTDLP_COOKIES_B64 must contain valid base64-encoded Netscape cookies.") from exc
-    else:
+    """Normalize raw Netscape text from Streamlit Secrets into a private temp file."""
+    if not YTDLP_COOKIE_SECRET:
         return None
 
-    text = cookie_bytes.decode("utf-8-sig", errors="strict")
-    has_cookie_record = any(
-        line.strip() and (not line.lstrip().startswith("#") or line.lstrip().startswith("#HttpOnly_"))
-        for line in text.splitlines()
-    )
-    if not has_cookie_record:
-        raise ValueError("The configured YouTube cookie secret is empty or is not a Netscape-format cookies export.")
-    cookie_bytes = text.encode("utf-8")
+    text = YTDLP_COOKIE_SECRET.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = text.split("\n")
+    header = "# Netscape HTTP Cookie File"
+    if not lines or lines[0].strip() != header:
+        raise ValueError(f"YTDLP_COOKIES must start with the standard {header!r} header.")
+
+    def valid_record(fields: list[str]) -> bool:
+        return (
+            len(fields) == 7
+            and bool(fields[0])
+            and fields[1].upper() in {"TRUE", "FALSE"}
+            and fields[2].startswith("/")
+            and fields[3].upper() in {"TRUE", "FALSE"}
+            and fields[4].isdigit()
+            and bool(fields[5])
+        )
+
+    normalized = [header]
+    pending = ""
+    record_indexes: list[int] = []
+    for raw_line in lines[1:]:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#") and not line.startswith("#HttpOnly_"):
+            if pending:
+                raise ValueError("YTDLP_COOKIES contains an incomplete cookie row before a comment line.")
+            normalized.append(line)
+            continue
+
+        # Some editors replace cookie-file tabs with spaces on a single wrapped row.
+        if "\t" not in line:
+            whitespace_fields = re.split(r"\s+", line)
+            if len(whitespace_fields) == 7:
+                line = "\t".join(whitespace_fields)
+
+        first_token = re.split(r"[\t\s]+", line, maxsplit=1)[0]
+        domain_prefix = first_token.removeprefix("#HttpOnly_")
+        looks_like_new_domain = line.startswith("#HttpOnly_") or (
+            "." in domain_prefix and "/" not in domain_prefix and " " not in domain_prefix
+        )
+        if not pending and line.count("\t") < 6 and record_indexes and not looks_like_new_domain:
+            # A soft-wrapped value on the following physical line belongs to the
+            # preceding Netscape row; joining without a separator restores it.
+            previous_index = record_indexes[-1]
+            previous_fields = normalized[previous_index].split("\t")
+            previous_fields[-1] += line
+            normalized[previous_index] = "\t".join(previous_fields)
+            continue
+
+        if pending:
+            fields = pending.split("\t")
+            next_field = line.split("\t", 1)[0]
+            expected_boundary = (
+                (len(fields) == 1 and next_field.upper() in {"TRUE", "FALSE"})
+                or (len(fields) == 2 and fields[1].upper() in {"TRUE", "FALSE"})
+                or (len(fields) == 3 and next_field.upper() in {"TRUE", "FALSE"})
+                or (len(fields) == 4 and next_field.isdigit())
+                or (len(fields) == 5 and fields[4].isdigit())
+                or len(fields) == 6
+            )
+            pending += ("\t" if expected_boundary else "") + line
+        else:
+            pending = line
+
+        fields = pending.split("\t")
+        if len(fields) > 7:
+            raise ValueError("YTDLP_COOKIES contains a row with more than seven Netscape fields.")
+        if len(fields) == 7:
+            if not valid_record(fields):
+                raise ValueError("YTDLP_COOKIES contains a malformed Netscape cookie row.")
+            record_indexes.append(len(normalized))
+            normalized.append("\t".join(fields))
+            pending = ""
+
+    if pending:
+        raise ValueError("YTDLP_COOKIES ends with an incomplete Netscape cookie row.")
+    if not record_indexes:
+        raise ValueError("YTDLP_COOKIES must include at least one valid Netscape cookie row after its header.")
+
+    cookie_bytes = ("\n".join(normalized) + "\n").encode("utf-8")
     folder.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="wb", prefix="youtube_cookies_", suffix=".txt", dir=folder, delete=False
@@ -414,7 +474,7 @@ def download_video(
         summary = CLOUD_DOWNLOAD_GUIDANCE if is_403 else "YouTube client and configured mirror fallbacks failed. Check the trace below for the exact errors."
         st.error(f"{summary}\n\n```text\n{error_text or traceback.format_exc()}\n```")
         if is_403:
-            st.info("If the video requires authentication, configure YTDLP_COOKIES or YTDLP_COOKIES_B64 in Streamlit Secrets with a Netscape-format cookie export. A supported PO Token provider may also help for token-required formats; configure YTDLP_PO_TOKEN and YTDLP_PO_TOKEN_CLIENT. Treat cookies like passwords. yt-dlp's YouTube OAuth login is no longer supported.")
+            st.info("If the video requires authentication, configure YTDLP_COOKIES in Streamlit Secrets with the raw Netscape-format cookie text. A supported PO Token provider may also help for token-required formats; configure YTDLP_PO_TOKEN and YTDLP_PO_TOKEN_CLIENT. Treat cookies like passwords. yt-dlp's YouTube OAuth login is no longer supported.")
         raise VideoDownloadError(summary)
     except VideoDownloadError:
         raise
@@ -872,7 +932,7 @@ st.title("✂️ Local AI Video Clipper")
 st.caption("Find topic moments, crop them to vertical 9:16, and burn in word-timed subtitles.")
 
 with st.sidebar:
-    has_youtube_auth = bool(YTDLP_COOKIE_SECRET or YTDLP_COOKIE_SECRET_B64)
+    has_youtube_auth = bool(YTDLP_COOKIE_SECRET)
     st.caption("YouTube authentication: configured in Streamlit Secrets." if has_youtube_auth else "YouTube authentication: no cookie secret configured.")
 
 with st.form("clipper_form", clear_on_submit=False):
